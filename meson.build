@@ -35,7 +35,7 @@ cc = meson.get_compiler('c')
 
 gumbo_dep = dependency('gumbo')
 libcurl_dep = dependency('libcurl')
-fuse_dep = dependency('fuse3')
+fuse_dep = dependency('fuse')
 uuid_dep = dependency('uuid')
 expat_dep = dependency('expat')
 openssl_dep = dependency('openssl')
