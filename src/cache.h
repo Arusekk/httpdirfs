@@ -54,6 +54,8 @@ struct Cache {
     pthread_mutex_t seek_lock;
     /** \brief mutex lock for write operation */
     pthread_mutex_t w_lock;
+    /** \brief mutex lock for seg access */
+    pthread_mutex_t seg_lock;
 
     /** \brief semaphore for the background thread */
     sem_t bgt_sem;
@@ -62,6 +64,10 @@ struct Cache {
 
     /** \brief the FUSE filesystem path to the remote file*/
     char *fs_path;
+
+    /** \brief recently written data buffer */
+    uint8_t *dbuf, *dbuf2;
+    off_t last, last2;
 };
 
 /**

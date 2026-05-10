@@ -461,12 +461,15 @@ Data_write(Cache *cf, const uint8_t *buf, off_t len,
         return 0;
     }
 
+    PTHREAD_MUTEX_LOCK(&cf->seg_lock);
     lprintf(cache_lock_debug, "thread %x: locking seek_lock;\n",
             pthread_self());
     PTHREAD_MUTEX_LOCK(&cf->seek_lock);
 
     long byte_written = 0;
+    int tries = 0;
 
+retry:
     if (fseeko(cf->dfp, offset, SEEK_SET)) {
         /*
          * fseeko failed
@@ -476,9 +479,10 @@ Data_write(Cache *cf, const uint8_t *buf, off_t len,
         goto end;
     }
 
+    errno = 0;
     byte_written = fwrite(buf, sizeof(uint8_t), len, cf->dfp);
 
-    if (byte_written != len) {
+    if (byte_written != len || fflush(cf->dfp) != 0) {
         lprintf(error, "fwrite(): requested %ld, returned %ld!\n", len,
                 byte_written);
     }
@@ -487,13 +491,41 @@ Data_write(Cache *cf, const uint8_t *buf, off_t len,
         /*
          * filesystem error
          */
-        lprintf(error, "fwrite(): encountered error!\n");
+        clearerr(cf->dfp);
+        lprintf(error, "fwrite(): encountered error! (%s)\n", strerror(errno));
+        if (errno == ENOSPC) {
+            int fd = fileno(cf->dfp);
+            int done = 0, fail = 0;
+            int want = 16;
+            int max = cf->segbc;
+            for (int v = 2; done < want && v < 256; v++) {
+                lprintf(error, "out of space: punching %d-holes (%d/%d/%d)...\n", v, done, want, max);
+                for (int i = 0; i < cf->segbc; i++) {
+                    if (cf->seg[i] == 0 && v == 1) max--;  // do not count zeros
+                    off_t off = (off_t)i * cf->blksz;
+                    if (0 != cf->seg[i] && cf->seg[i] <= v && off != cf->last && off != cf->last2) {
+                        if (fallocate(fd, FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE, off, cf->blksz) != 0) {
+                            lprintf(error, "out of space: punching %d-holes (%d/%d/%d)... %d fail: %s\n", v, done, want, max, ++fail, strerror(errno));
+                        } else {
+                            cf->seg[i] = 0;
+                            done++;
+                            lprintf(error, "out of space: punching %d-holes (%d/%d/%d)...\n", v, done, want, max);
+                            if (done >= want) break;
+                        }
+                    }
+                }
+            }
+            lprintf(error, "punching holes done (%d/%d/%d)!\n", done, want, max);
+            if (!tries++)
+                goto retry;
+        }
     }
 
 end:
     lprintf(cache_lock_debug, "thread %x: unlocking seek_lock;\n",
             pthread_self());
     PTHREAD_MUTEX_UNLOCK(&cf->seek_lock);
+    PTHREAD_MUTEX_UNLOCK(&cf->seg_lock);
     return byte_written;
 }
 
@@ -889,6 +921,7 @@ cf->content_length: %ld, Data_size(fn): %ld.\n",
      */
     cf->link->cache_ptr = cf;
 
+    cf->last = cf->last2 = -1;
     lprintf(cache_lock_debug, "thread %x: unlocking cf_lock;\n",
             pthread_self());
     PTHREAD_MUTEX_UNLOCK(&cf_lock);
@@ -933,6 +966,10 @@ void Cache_close(Cache *cf)
         lprintf(error, "cannot close data file %s.\n", strerror(errno));
     }
 
+    if (cf->dbuf2)
+        FREE(cf->dbuf2);
+    if (cf->dbuf)
+        FREE(cf->dbuf);
     cf->link->cache_ptr = NULL;
 
     lprintf(cache_lock_debug,
@@ -949,7 +986,13 @@ void Cache_close(Cache *cf)
 static int Seg_exist(Cache *cf, off_t offset)
 {
     off_t byte = offset / cf->blksz;
-    return cf->seg[byte];
+    return cf->seg[byte] > 1;
+}
+static void Seg_used(Cache *cf, off_t offset)
+{
+    off_t byte = offset / cf->blksz;
+    if (cf->seg[byte] < 255)
+        cf->seg[byte]++;
 }
 
 /**
@@ -981,6 +1024,7 @@ static void *Cache_bgdl(void *arg)
 
     uint8_t *recv_buf = CALLOC(cf->blksz, sizeof(uint8_t));
     lprintf(debug, "thread %x spawned.\n ", pthread_self());
+    Seg_set(cf, cf->next_dl_offset, 1);
     long recv = Link_download(cf->link, (char *)recv_buf, cf->blksz,
                               cf->next_dl_offset);
     if (recv < 0) {
@@ -993,7 +1037,7 @@ which doesn't make sense\n",
         || (cf->next_dl_offset
             == (cf->content_length / cf->blksz * cf->blksz))) {
         if (Data_write(cf, recv_buf, recv, cf->next_dl_offset) == recv) {
-            Seg_set(cf, cf->next_dl_offset, 1);
+            Seg_set(cf, cf->next_dl_offset, 2);
         }
     } else {
         lprintf(error, "received %ld rather than %ld, possible network \
@@ -1001,7 +1045,14 @@ error.\n",
                 recv, cf->blksz);
     }
 
-    FREE(recv_buf);
+    if (cf->dbuf) {
+        if (cf->dbuf2)
+            FREE(cf->dbuf2);
+        cf->dbuf2 = cf->dbuf;
+        cf->last2 = cf->last;
+    }
+    cf->dbuf = recv_buf;
+    cf->last = cf->next_dl_offset;
 
     lprintf(cache_lock_debug, "thread %x: unlocking w_lock;\n", pthread_self());
     PTHREAD_MUTEX_UNLOCK(&cf->w_lock);
@@ -1047,10 +1098,14 @@ static long Cache_read_segment(Cache *cf, char *const output_buf,
     /*
      * ------------- Check if the segment already exists --------------
      */
+    PTHREAD_MUTEX_LOCK(&cf->seg_lock);
     if (Seg_exist(cf, dl_offset)) {
+        Seg_used(cf, dl_offset);
         send = Data_read(cf, (uint8_t *)output_buf, len, offset_start);
+        PTHREAD_MUTEX_UNLOCK(&cf->seg_lock);
         goto bgdl;
     } else {
+        PTHREAD_MUTEX_UNLOCK(&cf->seg_lock);
         /*
          * Wait for any other download thread to finish
          */
@@ -1059,7 +1114,21 @@ static long Cache_read_segment(Cache *cf, char *const output_buf,
                 pthread_self());
         PTHREAD_MUTEX_LOCK(&cf->w_lock);
 
-        if (Seg_exist(cf, dl_offset)) {
+        if (dl_offset == cf->last) {
+            send = len;
+            memcpy(output_buf, cf->dbuf + offset_start - dl_offset, send);
+            lprintf(cache_lock_debug,
+                    "thread %x: unlocking w_lock;\n", pthread_self());
+            PTHREAD_MUTEX_UNLOCK(&cf->w_lock);
+            goto bgdl;
+        } else if (dl_offset == cf->last2) {
+            send = len;
+            memcpy(output_buf, cf->dbuf2 + offset_start - dl_offset, send);
+            lprintf(cache_lock_debug,
+                    "thread %x: unlocking w_lock;\n", pthread_self());
+            PTHREAD_MUTEX_UNLOCK(&cf->w_lock);
+            goto bgdl;
+        } else if (Seg_exist(cf, dl_offset)) {
             /*
              * The segment now exists - it was downloaded by another
              * download thread. Send it off and unlock the I/O
@@ -1080,6 +1149,7 @@ static long Cache_read_segment(Cache *cf, char *const output_buf,
 
     uint8_t *recv_buf = CALLOC(cf->blksz, sizeof(uint8_t));
     lprintf(debug, "thread %x: spawned.\n ", pthread_self());
+    Seg_set(cf, dl_offset, 1);
     long recv = Link_download(cf->link, (char *)recv_buf, cf->blksz, dl_offset);
     if (recv < 0) {
         lprintf(error, "thread %x received %ld bytes, \
@@ -1095,7 +1165,7 @@ which doesn't make sense\n",
     if ((recv == cf->blksz)
         || (dl_offset == (cf->content_length / cf->blksz * cf->blksz))) {
         if (Data_write(cf, recv_buf, recv, dl_offset) == recv) {
-            Seg_set(cf, dl_offset, 1);
+            Seg_set(cf, dl_offset, 2);
         }
     } else {
         lprintf(error, "received %ld rather than %ld, possible network \
@@ -1111,7 +1181,14 @@ error.\n",
     } else {
         memcpy(output_buf, recv_buf + (offset_start - dl_offset), send);
     }
-    FREE(recv_buf);
+    if (cf->dbuf) {
+        if (cf->dbuf2)
+            FREE(cf->dbuf2);
+        cf->dbuf2 = cf->dbuf;
+        cf->last2 = cf->last;
+    }
+    cf->last = dl_offset;
+    cf->dbuf = recv_buf;
 
     lprintf(cache_lock_debug, "thread %x: unlocking w_lock;\n", pthread_self());
     PTHREAD_MUTEX_UNLOCK(&cf->w_lock);
@@ -1122,7 +1199,9 @@ error.\n",
 bgdl: {
 }
     off_t next_dl_offset = dl_offset + cf->blksz;
-    if (!Seg_exist(cf, next_dl_offset) && next_dl_offset < cf->content_length) {
+    if (next_dl_offset != cf->last && next_dl_offset != cf->last2
+            && !Seg_exist(cf, next_dl_offset)
+            && next_dl_offset < cf->content_length) {
         /*
          * Stop the spawning of multiple background pthreads
          */
