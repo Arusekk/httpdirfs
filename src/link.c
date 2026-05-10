@@ -89,6 +89,10 @@ static CURL *Link_to_curl(Link *link)
     if (ret) {
         lprintf(error, "%s", curl_easy_strerror(ret));
     }
+    ret = curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, -1);
+    if (ret) {
+        lprintf(error, "%s", curl_easy_strerror(ret));
+    }
     ret = curl_easy_setopt(curl, CURLOPT_SHARE, CURL_SHARE);
     if (ret) {
         lprintf(error, "%s", curl_easy_strerror(ret));
